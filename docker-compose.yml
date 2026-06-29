@@ -1,0 +1,200 @@
+version: "3.8"
+
+# ================================================
+# ZEPTO DARK STORE WAREHOUSE
+# Starts entire pipeline with: docker-compose up
+# ================================================
+
+networks:
+  zepto_network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  minio_data:
+  grafana_data:
+  airflow_logs:
+
+services:
+
+  # ================================================
+  # SOURCE LAYER — PostgreSQL
+  # Simulated Zepto Order Management System
+  # ================================================
+  postgres:
+    image: postgres:15
+    container_name: zepto_postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d
+    command: >
+      postgres
+      -c wal_level=logical
+      -c max_replication_slots=4
+      -c max_wal_senders=4
+    networks:
+      - zepto_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ================================================
+  # INGESTION LAYER — Zookeeper
+  # Required by Kafka for cluster coordination
+  # ================================================
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: zepto_zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - zepto_network
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ================================================
+  # INGESTION LAYER — Kafka
+  # Receives CDC events from Debezium
+  # ================================================
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: zepto_kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "9092:9092"
+    networks:
+      - zepto_network
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ================================================
+  # INGESTION LAYER — Debezium
+  # Reads PostgreSQL WAL and sends events to Kafka
+  # ================================================
+  debezium:
+    image: debezium/connect:2.4
+    container_name: zepto_debezium
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+      GROUP_ID: zepto_debezium_group
+      CONFIG_STORAGE_TOPIC: zepto_debezium_configs
+      OFFSET_STORAGE_TOPIC: zepto_debezium_offsets
+      STATUS_STORAGE_TOPIC: zepto_debezium_status
+    ports:
+      - "8083:8083"
+    volumes:
+      - ./debezium/connectors:/kafka/connect/custom-connectors
+    networks:
+      - zepto_network
+
+  # ================================================
+  # STORAGE LAYER — MinIO
+  # S3 compatible storage for Bronze/Silver/Gold
+  # ================================================
+  minio:
+    image: minio/minio:latest
+    container_name: zepto_minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    networks:
+      - zepto_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ================================================
+  # ORCHESTRATION LAYER — Airflow
+  # Orchestrates entire pipeline
+  # ================================================
+  airflow:
+    image: apache/airflow:2.8.0
+    container_name: zepto_airflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/plugins:/opt/airflow/plugins
+      - airflow_logs:/opt/airflow/logs
+    command: standalone
+    networks:
+      - zepto_network
+
+  # ================================================
+  # MONITORING LAYER — Grafana
+  # Pipeline health dashboards
+  # ================================================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: zepto_grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
+    networks:
+      - zepto_network
+
+  # ================================================
+  # LINEAGE LAYER — Marquez
+  # End to end data lineage tracking
+  # ================================================
+  marquez:
+    image: marquezproject/marquez:latest
+    container_name: zepto_marquez
+    ports:
+      - "5000:5000"
+      - "5001:5001"
+    networks:
+      - zepto_network
