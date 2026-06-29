@@ -83,3 +83,12 @@ This warehouse solves that by capturing every order event the moment it happens 
 ---
 
 ## Failure Scenarios
+
+| Failure | How Handled |
+|---|---|
+| Duplicate orders | dbt dedup with ROW_NUMBER() in Silver layer |
+| Late arriving events | Watermark on Kafka consumer |
+| Null store ID | Great Expectations catches it, routes to DLQ |
+| Broken schema | Data contract YAML version check |
+| Missing inventory data | GE freshness check, Slack alert if stale |
+| Negative delivery time | GE custom expectation, flagged in Silver |
